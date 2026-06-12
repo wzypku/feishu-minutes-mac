@@ -1,0 +1,415 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+本地说话人标注网页。
+
+在浏览器里给每个『说话人 N』填名字+邮箱（可边听录音边辨认），点保存即可：
+会写回 .md 的 speakers，自动改写正文、生成 participants，并推送到 world-feed。
+
+只监听 127.0.0.1，仅本机可访问。
+"""
+
+import html
+import os
+import threading
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import yaml
+
+import feishu_minutes_sync as fms
+
+AUDIO_EXTS = (".mp4", ".m4a", ".mp3", ".aac", ".wav")
+AUDIO_MIME = {".mp4": "video/mp4", ".m4a": "audio/mp4", ".mp3": "audio/mpeg",
+              ".aac": "audio/aac", ".wav": "audio/wav"}
+
+PAGE_CSS = """
+* { box-sizing: border-box; }
+body { font-family: -apple-system, "PingFang SC", sans-serif; margin: 0;
+  background: #f5f6f8; color: #1f2329; }
+.wrap { max-width: 760px; margin: 0 auto; padding: 24px 16px 64px; }
+h1 { font-size: 20px; margin: 8px 0 4px; }
+.sub { color: #8f959e; font-size: 13px; margin-bottom: 20px; }
+.card { background: #fff; border-radius: 12px; padding: 16px 18px; margin: 14px 0;
+  box-shadow: 0 1px 3px rgba(0,0,0,.06); }
+.spk { font-weight: 600; color: #3370ff; margin-bottom: 8px; }
+.q { color: #646a73; font-size: 13px; line-height: 1.7; margin: 2px 0;
+  padding-left: 10px; border-left: 3px solid #e5e6eb; }
+.row { display: flex; gap: 10px; margin-top: 12px; flex-wrap: wrap; }
+.row input { flex: 1 1 200px; padding: 9px 11px; border: 1px solid #d7d9de;
+  border-radius: 8px; font-size: 15px; }
+label.fld { font-size: 12px; color: #8f959e; display:block; margin-bottom:3px; }
+.col { flex: 1 1 200px; }
+button { background: #3370ff; color: #fff; border: 0; border-radius: 8px;
+  padding: 12px 22px; font-size: 15px; font-weight: 600; cursor: pointer; }
+button.ghost { background:#fff; color:#3370ff; border:1px solid #d7d9de; }
+audio { width: 100%; margin: 6px 0 2px; }
+a { color: #3370ff; text-decoration: none; }
+.bar { position: sticky; bottom: 0; background: #f5f6f8; padding: 14px 0;
+  display:flex; gap:12px; }
+.item { display:flex; justify-content:space-between; align-items:center;
+  padding:12px 0; border-bottom:1px solid #eee; }
+.entry { display:block; padding:12px 4px; border-bottom:1px solid #eee;
+  color:#1f2329; }
+.entry:last-child { border-bottom:0; }
+.etop { display:flex; justify-content:space-between; align-items:center; }
+.etitle { font-weight:600; color:#1f2329; }
+.tag { font-size:12px; padding:2px 8px; border-radius:10px; }
+.tag.need { background:#fff3e0; color:#d46b08; }
+.tag.done { background:#e7f9ec; color:#13a452; }
+.hint { background:#eef4ff; color:#3370ff; padding:10px 12px; border-radius:8px;
+  font-size:13px; margin-bottom:14px; }
+"""
+
+
+def _safe_path(save_dir, rel):
+    base = os.path.realpath(save_dir)
+    full = os.path.realpath(os.path.join(base, rel))
+    if full != base and not full.startswith(base + os.sep):
+        raise ValueError("非法路径")
+    return full
+
+
+def _find_audio(folder):
+    try:
+        for fn in sorted(os.listdir(folder)):
+            if os.path.splitext(fn)[1].lower() in AUDIO_EXTS:
+                return os.path.join(folder, fn)
+    except OSError:
+        pass
+    return None
+
+
+def _page(title, body):
+    return (f"<!doctype html><html><head><meta charset='utf-8'>"
+            f"<meta name='viewport' content='width=device-width,initial-scale=1'>"
+            f"<title>{html.escape(title)}</title><style>{PAGE_CSS}</style></head>"
+            f"<body><div class='wrap'>{body}</div></body></html>").encode("utf-8")
+
+
+def make_handler(cfg):
+    save_dir = os.path.expanduser(cfg["save_dir"])
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _send(self, code, body, ctype="text/html; charset=utf-8", extra=None):
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            for k, v in (extra or {}).items():
+                self.send_header(k, v)
+            self.end_headers()
+            self.wfile.write(body)
+
+        # ---------- 列表页 ----------
+        def page_index(self):
+            pending, labeled = [], []
+            for root, _d, files in os.walk(save_dir):
+                for fn in files:
+                    if not fn.endswith(".md"):
+                        continue
+                    path = os.path.join(root, fn)
+                    try:
+                        with open(path, encoding="utf-8") as f:
+                            front, _r, body = fms.split_frontmatter(f.read())
+                    except Exception:
+                        continue
+                    if not front:
+                        continue
+                    rel = os.path.relpath(path, save_dir)
+                    info = {"title": front.get("title", fn), "rel": rel,
+                            "date": str(front.get("date", "")),
+                            "duration": str(front.get("duration", "")),
+                            "kw": fms.transcript_keywords(body),
+                            "parts": front.get("participants") or []}
+                    st = front.get("status")
+                    if st == "needs-speakers":
+                        spk = front.get("speakers") or {}
+                        if any(v is None or str(v).strip() == "" for v in spk.values()):
+                            pending.append(info)
+                            continue
+                    if st == "labeled" and front.get("participants"):
+                        labeled.append(info)
+            pending.sort(key=lambda x: x["date"], reverse=True)
+            labeled.sort(key=lambda x: x["date"], reverse=True)
+
+            def card(info, tag_cls, tag_txt):
+                meta = " · ".join(x for x in [info["date"], info["duration"]] if x)
+                kw = (f"<div class='q' style='border:0;padding:0;margin-top:4px'>🔖 "
+                      f"{html.escape(info['kw'])}</div>") if info["kw"] else ""
+                ppl = ""
+                if info["parts"]:
+                    names = "、".join(fms.speaker_name(str(p)) for p in info["parts"])
+                    ppl = (f"<div class='q' style='border:0;padding:0;margin-top:2px'>👥 "
+                           f"{html.escape(names)}</div>")
+                return (f"<a class='entry' href='/edit?f={urllib.parse.quote(info['rel'])}'>"
+                        f"<div class='etop'><span class='etitle'>{html.escape(info['title'])}</span>"
+                        f"<span class='tag {tag_cls}'>{tag_txt}</span></div>"
+                        f"<div class='sub' style='margin:2px 0 0'>🕒 {html.escape(meta)}</div>"
+                        f"{kw}{ppl}</a>")
+
+            rows = ""
+            if not pending:
+                rows += "<div class='card'>🎉 没有待标注的转写</div>"
+            else:
+                rows += "<div class='card'>" + "".join(
+                    card(i, "need", "待标注") for i in pending) + "</div>"
+            if labeled:
+                rows += "<div class='sub' style='margin-top:18px'>已标注</div>"
+                rows += "<div class='card'>" + "".join(
+                    card(i, "done", "已标注") for i in labeled[:40]) + "</div>"
+            body = (f"<h1>飞书妙记 · 说话人标注</h1>"
+                    f"<div class='sub'>待标注 {len(pending)} 个 · 已标注 {len(labeled)} 个</div>{rows}")
+            self._send(200, _page("说话人标注", body))
+
+        # ---------- 编辑页 ----------
+        def page_edit(self, rel):
+            path = _safe_path(save_dir, rel)
+            with open(path, encoding="utf-8") as f:
+                front, _raw, body = fms.split_frontmatter(f.read())
+            if not front:
+                self._send(404, _page("出错", "<h1>无法解析该文件</h1>"))
+                return
+            title = front.get("title", os.path.basename(path))
+            meta = " · ".join(x for x in [str(front.get("date", "")),
+                                          str(front.get("duration", ""))] if x)
+            kw = fms.transcript_keywords(body)
+            head = (f"<h1>{html.escape(title)}</h1>"
+                    f"<div class='sub'>🕒 {html.escape(meta)}</div>"
+                    + (f"<div class='sub'>🔖 {html.escape(kw)}</div>" if kw else ""))
+            spk = front.get("speakers") or {}
+            labels = list(spk.keys())
+
+            if front.get("status") == "labeled":
+                parts = front.get("participants") or []
+                items = "".join(f"<div class='q'>{html.escape(str(p))}</div>" for p in parts)
+                emails = [fms.parse_participant(str(p)) for p in parts]
+                to_names = [n for n, e in emails if e]
+                has_email = bool(to_names)
+                auto = bool(cfg.get("email_auto_send", False))
+                send_btn = ""
+                if has_email:
+                    if auto:
+                        btxt = f"✉️ 直接发送给 {len(to_names)} 位参与者"
+                        confirm = ("onsubmit=\"return confirm('确定直接发送给："
+                                   + "、".join(to_names) + "？发送后无法撤回。')\"")
+                    else:
+                        btxt = "✉️ 用 Outlook 打开草稿"
+                        confirm = ""
+                    send_btn = (f"<form method='POST' action='/send' style='display:inline' "
+                                f"{confirm}>"
+                                f"<input type='hidden' name='f' value='{html.escape(rel)}'>"
+                                f"<button type='submit'>{btxt}</button></form>")
+                else:
+                    send_btn = "<div class='sub'>（参与者都没填邮箱，无法发送）</div>"
+                body_html = (
+                    f"{head}"
+                    f"<div class='hint'>这条已标注。participants（可直接用于发送）：</div>"
+                    f"<div class='card'>{items or '（无）'}</div>"
+                    f"<div class='bar'>{send_btn} "
+                    f"<a href='/' style='align-self:center'>返回列表</a></div>")
+                self._send(200, _page(title, body_html))
+                return
+
+            audio = _find_audio(os.path.dirname(path))
+            audio_html = ""
+            if audio:
+                arel = os.path.relpath(audio, save_dir)
+                audio_html = (f"<div class='card'><div class='spk'>🎧 边听边认</div>"
+                              f"<audio controls preload='none' "
+                              f"src='/audio?f={urllib.parse.quote(arel)}'></audio>"
+                              f"<div class='sub'>听不准也没关系，下面有每人的发言示例</div></div>")
+
+            # 通讯录：下拉选择，选名字自动带出邮箱
+            contacts = fms.load_contacts()
+            options = "".join(f"<option value='{html.escape(c.get('name',''))}'>"
+                              for c in contacts)
+            import json as _json
+            cmap = _json.dumps({c.get("name", ""): c.get("email", "") for c in contacts},
+                               ensure_ascii=False)
+
+            cards = ""
+            for i, label in enumerate(labels):
+                cur = "" if spk.get(label) is None else str(spk.get(label))
+                cur_name = fms.speaker_name(cur) if cur else ""
+                import re as _re
+                me = _re.search(r"<(.+?)>", cur)
+                cur_email = me.group(1).strip() if me else ""
+                quotes = fms.sample_quotes_for(body, label, n=3)
+                qhtml = "".join(f"<div class='q'>“{html.escape(q)}”</div>" for q in quotes)
+                cards += (
+                    f"<div class='card'><div class='spk'>{html.escape(label)}</div>{qhtml}"
+                    f"<input type='hidden' name='label{i}' value='{html.escape(label)}'>"
+                    f"<div class='row'>"
+                    f"<div class='col'><label class='fld'>名字（可下拉选历史联系人）</label>"
+                    f"<input name='name{i}' value='{html.escape(cur_name)}' list='contacts' "
+                    f"data-i='{i}' oninput='fillEmail(this)' placeholder='如 张三' "
+                    f"autocomplete='off'></div>"
+                    f"<div class='col'><label class='fld'>邮箱（可选）</label>"
+                    f"<input name='email{i}' id='email{i}' value='{html.escape(cur_email)}' "
+                    f"placeholder='zhangsan@example.com' autocomplete='off'></div>"
+                    f"</div></div>")
+
+            js = (f"<datalist id='contacts'>{options}</datalist>"
+                  f"<script>const CMAP={cmap};"
+                  f"function fillEmail(inp){{const e=document.getElementById('email'+inp.dataset.i);"
+                  f"if(CMAP[inp.value]&&!e.value){{e.value=CMAP[inp.value];}}}}</script>")
+
+            body_html = (
+                f"{head}"
+                f"<div class='hint'>给每位说话人填上名字（邮箱可选）。名字框可下拉选以前填过的人，"
+                f"自动带出邮箱。保存后会自动改写转写、生成 participants 并同步。</div>"
+                f"{audio_html}"
+                f"<form method='POST' action='/save'>"
+                f"<input type='hidden' name='f' value='{html.escape(rel)}'>"
+                f"{cards}"
+                f"<div class='bar'><button type='submit'>保存并应用</button>"
+                f"<a href='/' style='align-self:center'>返回列表</a></div>"
+                f"</form>{js}")
+            self._send(200, _page(title, body_html))
+
+        # ---------- 保存 ----------
+        def do_save(self, form):
+            rel = form.get("f", [""])[0]
+            path = _safe_path(save_dir, rel)
+            with open(path, encoding="utf-8") as f:
+                front, _raw, body = fms.split_frontmatter(f.read())
+            spk = front.get("speakers") or {}
+            i = 0
+            while f"label{i}" in form:
+                label = form[f"label{i}"][0]
+                name = form.get(f"name{i}", [""])[0].strip()
+                email = form.get(f"email{i}", [""])[0].strip()
+                if name:
+                    spk[label] = name + (f" <{email}>" if email else "")
+                i += 1
+            front["speakers"] = spk
+            new_fm = yaml.safe_dump(front, allow_unicode=True, sort_keys=False).strip()
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("---\n" + new_fm + "\n---\n" + body)
+            result = fms.apply_speaker_labels(path)
+            try:
+                fms.git_push_notes(cfg)
+            except Exception:
+                pass
+            if result == "applied":
+                msg = ("✅ 已标注完成并同步到 world-feed。",
+                       "正文里的说话人已替换成真名，participants 已生成。")
+            else:
+                msg = ("💾 已保存。", "还有说话人没填名字，填完再保存即可自动应用。")
+            body_html = (f"<h1>{msg[0]}</h1><div class='sub'>{msg[1]}</div>"
+                         f"<div class='bar'><a href='/'>← 回到列表，继续标注下一个</a></div>"
+                         f"<script>setTimeout(function(){{location.href='/'}},1400)</script>")
+            self._send(200, _page("已保存", body_html))
+
+        # ---------- 发送邮件 ----------
+        def do_send(self, form):
+            rel = form.get("f", [""])[0]
+            path = _safe_path(save_dir, rel)
+            auto = bool(cfg.get("email_auto_send", False))
+            res = fms.compose_email(cfg, path, auto_send=auto)
+            if not res.get("ok"):
+                extra = ""
+                if res.get("no_email"):
+                    extra = "<div class='sub'>未填邮箱：" + "、".join(
+                        html.escape(n) for n in res["no_email"]) + "</div>"
+                body_html = (f"<h1>⚠️ 无法发送</h1>"
+                             f"<div class='sub'>{html.escape(res.get('error',''))}</div>{extra}"
+                             f"<div class='bar'><a href='/edit?f={urllib.parse.quote(rel)}'>"
+                             f"← 返回</a></div>")
+                self._send(200, _page("发送", body_html))
+                return
+            to_html = "".join(f"<div class='q'>{html.escape(n)} &lt;{html.escape(e)}&gt;</div>"
+                              for n, e in res["to"])
+            noemail = ""
+            if res.get("no_email"):
+                noemail = ("<div class='sub' style='margin-top:8px'>以下参与者没填邮箱、未加入收件人："
+                           + "、".join(html.escape(n) for n in res["no_email"]) + "</div>")
+            if res["mode"] == "sent":
+                lead = "✅ 已通过 Outlook 发送给："
+            else:
+                lead = "✉️ 已在 Outlook 打开草稿（请检查后点发送），收件人："
+            body_html = (f"<h1>{lead.split('，')[0]}</h1>"
+                         f"<div class='hint'>{lead}</div><div class='card'>{to_html}</div>"
+                         f"{noemail}"
+                         f"<div class='bar'><a href='/'>← 返回列表</a></div>")
+            self._send(200, _page("发送", body_html))
+
+        # ---------- 音频 ----------
+        def serve_audio(self, rel):
+            path = _safe_path(save_dir, rel)
+            if not os.path.exists(path):
+                self._send(404, b"not found", "text/plain")
+                return
+            ext = os.path.splitext(path)[1].lower()
+            with open(path, "rb") as f:
+                data = f.read()
+            self._send(200, data, AUDIO_MIME.get(ext, "application/octet-stream"))
+
+        def do_GET(self):
+            u = urllib.parse.urlparse(self.path)
+            q = urllib.parse.parse_qs(u.query)
+            try:
+                if u.path == "/":
+                    self.page_index()
+                elif u.path == "/edit":
+                    self.page_edit(q.get("f", [""])[0])
+                elif u.path == "/audio":
+                    self.serve_audio(q.get("f", [""])[0])
+                else:
+                    self._send(404, _page("404", "<h1>404</h1>"))
+            except Exception as e:
+                self._send(500, _page("出错", f"<h1>出错</h1><pre>{html.escape(repr(e))}</pre>"))
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(length).decode("utf-8")
+            form = urllib.parse.parse_qs(raw, keep_blank_values=True)
+            try:
+                p = urllib.parse.urlparse(self.path).path
+                if p == "/save":
+                    self.do_save(form)
+                elif p == "/send":
+                    self.do_send(form)
+                else:
+                    self._send(404, _page("404", "<h1>404</h1>"))
+            except Exception as e:
+                self._send(500, _page("出错", f"<h1>出错</h1><pre>{html.escape(repr(e))}</pre>"))
+
+    return Handler
+
+
+_server = None
+
+
+def start_in_thread(cfg):
+    """在后台线程启动网页服务。返回 (host, port) 或 None。"""
+    global _server
+    if _server is not None:
+        return _server.server_address
+    try:
+        fms.seed_contacts_from_files(cfg)  # 启动时收集历史联系人，供下拉
+    except Exception:
+        pass
+    port = int(cfg.get("web_port", 8765))
+    try:
+        _server = ThreadingHTTPServer(("127.0.0.1", port), make_handler(cfg))
+    except OSError as e:
+        fms.log(f"网页服务启动失败（端口 {port} 被占用？）：{e}")
+        return None
+    t = threading.Thread(target=_server.serve_forever, daemon=True)
+    t.start()
+    fms.log(f"说话人标注网页已启动：http://127.0.0.1:{port}/")
+    return ("127.0.0.1", port)
+
+
+if __name__ == "__main__":
+    cfg = fms.load_config()
+    addr = start_in_thread(cfg)
+    if addr:
+        print(f"http://{addr[0]}:{addr[1]}/  (Ctrl+C 退出)")
+        import time
+        while True:
+            time.sleep(3600)

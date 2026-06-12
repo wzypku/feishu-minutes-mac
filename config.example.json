@@ -1,0 +1,20 @@
+{
+  "cookie_source": "browser",
+  "cookie": "",
+  "save_dir": "~/Documents/FeishuMinutes",
+  "poll_interval_seconds": 60,
+  "space_name": 1,
+  "download_audio": true,
+  "transcript_with_speaker": true,
+  "transcript_with_timestamp": false,
+  "sync_existing": false,
+  "language": "zh_cn",
+  "git_sync": false,
+  "git_repo_dir": "",
+  "git_notes_subdir": "feishu-minutes",
+  "git_branch": "main",
+  "web_enabled": true,
+  "web_port": 8765,
+  "web_autopopup": true,
+  "email_auto_send": false
+}
