@@ -70,6 +70,26 @@
 
 ---
 
+## 常见问题 / 排错
+
+- **双击 `install.command` 被拦（"无法打开，因为来自身份不明的开发者"）**
+  右键点它 → 选「打开」→ 再点「打开」。这是 macOS 对下载文件的安全提示，只需第一次。
+  （安装脚本会自动解除随包其它文件的隔离，所以只用对它本身放行一次。）
+- **没自动同步？** 确认浏览器（Edge/Chrome）里登录着飞书妙记；看日志
+  `tail -f ~/<安装目录>/launchd.out.log`。
+- **网页打不开？** 后台服务可能没起：`launchctl load ~/Library/LaunchAgents/com.feishu.minutes-sync.plist`。
+- **发邮件按钮没反应？** 需要本机装并登录 Microsoft Outlook。没有 Outlook 就用不了发送，
+  但同步和标注不受影响。
+- **第一次跑 `python3` 弹"安装命令行工具"** 点安装即可（macOS 自带 Python 需要它）。
+
+---
+
+## License
+
+MIT，见 `LICENSE`。自由分享、修改、二次分发。
+
+---
+
 ## 它是怎么工作的（给好奇的人）
 
 - 通过妙记网页接口（`meetings.feishu.cn/minutes/api`）+ 浏览器里的登录态，列出妙记、

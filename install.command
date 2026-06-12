@@ -13,6 +13,9 @@ echo "  安装目录：$DIR"
 echo "════════════════════════════════════════════"
 echo
 
+# 0) 解除下载隔离（Gatekeeper），让随包文件可正常运行
+xattr -dr com.apple.quarantine "$DIR" 2>/dev/null || true
+
 # 1) Python 与依赖
 echo "▸ 检查 Python 依赖（pyyaml / cryptography）…"
 if ! $PY -c "import yaml, cryptography" 2>/dev/null; then
@@ -61,7 +64,8 @@ echo "  1. 用 Edge 或 Chrome 登录 https://meetings.feishu.cn/minutes/me"
 echo "  2. 之后用录音豆录音、上传到飞书妙记，约 1 分钟内会自动同步到本地"
 echo "     默认保存在 ~/Documents/FeishuMinutes/"
 echo
-echo "标注说话人 / 控制台：双击「飞书妙记.app」，或打开 http://127.0.0.1:8765/"
+PORT=$($PY -c "import json;print(json.load(open('$DIR/config.json'))['web_port'])" 2>/dev/null || echo 8765)
+echo "标注说话人 / 控制台：双击「飞书妙记.app」，或打开 http://127.0.0.1:$PORT/"
 echo "卸载：双击 uninstall.command"
 echo
 read -n 1 -s -r -p "按任意键关闭…"
