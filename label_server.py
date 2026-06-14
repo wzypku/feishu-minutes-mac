@@ -124,14 +124,14 @@ def make_handler(cfg):
                             "duration": str(front.get("duration", "")),
                             "kw": fms.transcript_keywords(body),
                             "parts": front.get("participants") or []}
+                    # 待标注 = 有未填的说话人；其余（含单人录音）都归"已处理"，全部显示
                     st = front.get("status")
+                    is_pending = False
                     if st == "needs-speakers":
                         spk = front.get("speakers") or {}
-                        if any(v is None or str(v).strip() == "" for v in spk.values()):
-                            pending.append(info)
-                            continue
-                    if st == "labeled" and front.get("participants"):
-                        labeled.append(info)
+                        is_pending = (not spk) or any(
+                            v is None or str(v).strip() == "" for v in spk.values())
+                    (pending if is_pending else labeled).append(info)
             pending.sort(key=lambda x: x["date"], reverse=True)
             labeled.sort(key=lambda x: x["date"], reverse=True)
 

@@ -790,6 +790,97 @@ def voiceprint_recognize(cfg, md_path):
     return True
 
 
+def sync_titles(cfg, api=None):
+    """飞书事后给录音改了名（录音豆初始名→AI 内容标题），同步到本地 frontmatter+H1。
+    只改标题行，保留 speakers/voiceprint 等其它内容。返回改名条数。"""
+    import glob
+    api = api or FeishuMinutes(cfg)
+    try:
+        cloud = {x["object_token"]: x.get("topic", "") for x in api.list_minutes()}
+    except Exception:
+        return 0
+    save_dir = os.path.expanduser(cfg["save_dir"])
+    changed = 0
+    for md in glob.glob(os.path.join(save_dir, "*", "*.md")):
+        try:
+            with open(md, encoding="utf-8") as f:
+                text = f.read()
+            front, raw, body = split_frontmatter(text)
+            if not front:
+                continue
+            tok = front.get("source", "").rsplit("/", 1)[-1]
+            new = cloud.get(tok)
+            old = front.get("title", "")
+            if not new or new == old:
+                continue
+            safe = new.replace('"', "'")
+            new_raw = re.sub(r'(?m)^title:.*$', f'title: "{safe}"', raw, count=1)
+            new_body = re.sub(r'(?m)^# .*$', f"# {new}", body, count=1)
+            with open(md, "w", encoding="utf-8") as f:
+                f.write("---\n" + new_raw + "\n---\n" + new_body)
+            changed += 1
+            log(f"  飞书已改名：《{old}》→《{new}》")
+        except Exception as e:
+            log(f"  标题同步出错 {os.path.basename(md)}: {e!r}")
+    return changed
+
+
+def _recording_age_hours(front):
+    try:
+        t = time.mktime(time.strptime(front.get("date", ""), "%Y-%m-%d %H:%M"))
+        return (time.time() - t) / 3600
+    except Exception:
+        return 1e9
+
+
+def refresh_transcripts(cfg, api=None, state=None):
+    """补刷"同步时还没转写完"的空转写：飞书转好了就重新生成带说话人的转写。
+    永久空的（静音等）超过 6 小时就不再轮询。返回补刷条数。"""
+    import glob
+    import label_server
+    api = api or FeishuMinutes(cfg)
+    try:
+        cloud = {x["object_token"]: x for x in api.list_minutes()}
+    except Exception:
+        return 0
+    save_dir = os.path.expanduser(cfg["save_dir"])
+    skip = set((state or {}).get("empty_done", []))
+    refreshed = 0
+    for md in glob.glob(os.path.join(save_dir, "*", "*.md")):
+        try:
+            with open(md, encoding="utf-8") as f:
+                front, _raw, body = split_frontmatter(f.read())
+            if not front or front.get("participants"):
+                continue  # 用户已标注的不动
+            if detect_generic_speakers(body):
+                continue  # 已有说话人，正常
+            token = front.get("source", "").rsplit("/", 1)[-1]
+            if not token or token in skip:
+                continue
+            meta = cloud.get(token)
+            if not meta:
+                continue
+            new_t = api.export_transcript(token)
+            new_sp = detect_generic_speakers(new_t or "")
+            if new_sp:
+                ts = parse_transcript_date(new_t) or time.time() * 1000
+                audio = label_server._find_audio(os.path.dirname(md))
+                af = os.path.basename(audio) if audio else None
+                md_text = build_markdown(meta, ts, None, new_t, af)
+                with open(md, "w", encoding="utf-8") as f:
+                    f.write(md_text)
+                refreshed += 1
+                log(f"  补刷转写：{os.path.basename(os.path.dirname(md))}（{len(new_sp)}人）")
+            elif state is not None and _recording_age_hours(front) > 6:
+                skip.add(token)  # 6 小时还空，判定永久空，不再查
+        except Exception as e:
+            log(f"  补刷出错 {os.path.basename(md)}: {e!r}")
+    if state is not None and skip != set(state.get("empty_done", [])):
+        state["empty_done"] = sorted(skip)
+        save_state(state)
+    return refreshed
+
+
 def scan_and_apply_labels(cfg):
     """扫描归档目录，应用所有已填好的标注。返回应用的条数。"""
     save_dir = os.path.expanduser(cfg["save_dir"])
@@ -1085,6 +1176,16 @@ def run_once(api, cfg, state):
     # 有新转写待标注 → 自动弹出本地网页让你标注
     if new_pending and cfg.get("web_autopopup", True):
         open_label_page(cfg, new_pending)
+    # 补刷"同步时还没转写完"的空转写
+    try:
+        refresh_transcripts(cfg, api, state)
+    except Exception as e:
+        log(f"转写补刷环节出错：{e!r}")
+    # 飞书事后改名 → 同步到本地标题
+    try:
+        sync_titles(cfg, api)
+    except Exception as e:
+        log(f"标题同步环节出错：{e!r}")
     # 应用你已填好的说话人标注（改写正文 + 生成 participants）
     scan_and_apply_labels(cfg)
     # 本轮有新笔记/新标注，或上一轮提交后没推成功，都尝试推送
