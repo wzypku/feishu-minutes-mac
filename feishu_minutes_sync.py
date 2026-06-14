@@ -747,7 +747,7 @@ def voiceprint_enroll(cfg, md_path):
         if label not in embs:
             continue
         name, email = parse_participant(str(value))
-        key = (email.lower() if email else name)
+        key = name.strip().lower()  # 按名字归并，避免同一个人填/不填邮箱时分裂成两条
         if not key:
             continue
         new = embs[label]
@@ -756,7 +756,7 @@ def voiceprint_enroll(cfg, md_path):
             cnt = db[key].get("count", 1)
             avg = (old * cnt + new) / (cnt + 1)
             avg = avg / (np.linalg.norm(avg) or 1)
-            db[key] = {"name": name, "email": email,
+            db[key] = {"name": name, "email": email or db[key].get("email", ""),
                        "emb": avg.tolist(), "count": cnt + 1}
         else:
             db[key] = {"name": name, "email": email,
@@ -765,6 +765,31 @@ def voiceprint_enroll(cfg, md_path):
     if changed:
         _save_vpdb(db)
         log(f"  声纹库已更新（{os.path.basename(os.path.dirname(md_path))}）")
+
+
+def dedupe_vpdb():
+    """把同名的声纹条目合并成一条（按 count 加权平均），修掉历史产生的重复。"""
+    import numpy as np
+    db = _load_vpdb()
+    merged = {}
+    for v in db.values():
+        nk = (v.get("name") or "").strip().lower()
+        if not nk:
+            continue
+        if nk in merged:
+            a = merged[nk]
+            ca, cb = a.get("count", 1), v.get("count", 1)
+            emb = (np.asarray(a["emb"], dtype=np.float32) * ca
+                   + np.asarray(v["emb"], dtype=np.float32) * cb) / (ca + cb)
+            emb = emb / (np.linalg.norm(emb) or 1)
+            a["emb"] = emb.tolist()
+            a["count"] = ca + cb
+            a["email"] = a.get("email") or v.get("email", "")
+        else:
+            merged[nk] = dict(v)
+    if len(merged) != len(db):
+        _save_vpdb(merged)
+    return merged
 
 
 def voiceprint_recognize(cfg, md_path, allow_compute=True):
