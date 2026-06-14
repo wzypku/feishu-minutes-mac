@@ -16,5 +16,8 @@
   "web_enabled": true,
   "web_port": 8765,
   "web_autopopup": true,
-  "email_auto_send": false
+  "email_auto_send": false,
+  "voiceprint_enabled": true,
+  "voiceprint_threshold": 0.62,
+  "voiceprint_margin": 0.06
 }

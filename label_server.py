@@ -230,6 +230,7 @@ def make_handler(cfg):
             cmap = _json.dumps({c.get("name", ""): c.get("email", "") for c in contacts},
                                ensure_ascii=False)
 
+            vp = front.get("voiceprint") or {}  # 声纹识别预填
             cards = ""
             for i, label in enumerate(labels):
                 cur = "" if spk.get(label) is None else str(spk.get(label))
@@ -237,10 +238,18 @@ def make_handler(cfg):
                 import re as _re
                 me = _re.search(r"<(.+?)>", cur)
                 cur_email = me.group(1).strip() if me else ""
+                vp_hint = ""
+                sug = vp.get(label)
+                if sug and not cur_name:  # 没手填时用声纹建议预填
+                    cur_name = sug.get("name", "")
+                    cur_email = sug.get("email", "") or cur_email
+                    vp_hint = (f"<div class='q' style='border-color:#3370ff;color:#3370ff'>"
+                               f"🔊 声纹识别：很可能是 <b>{html.escape(sug.get('name',''))}</b>"
+                               f"（置信度 {sug.get('score','')}）— 已自动填入，确认或改正即可</div>")
                 quotes = fms.sample_quotes_for(body, label, n=3)
                 qhtml = "".join(f"<div class='q'>“{html.escape(q)}”</div>" for q in quotes)
                 cards += (
-                    f"<div class='card'><div class='spk'>{html.escape(label)}</div>{qhtml}"
+                    f"<div class='card'><div class='spk'>{html.escape(label)}</div>{vp_hint}{qhtml}"
                     f"<input type='hidden' name='label{i}' value='{html.escape(label)}'>"
                     f"<div class='row'>"
                     f"<div class='col'><label class='fld'>名字（可下拉选历史联系人）</label>"
@@ -290,6 +299,11 @@ def make_handler(cfg):
             with open(path, "w", encoding="utf-8") as f:
                 f.write("---\n" + new_fm + "\n---\n" + body)
             result = fms.apply_speaker_labels(path)
+            if result == "applied":
+                try:
+                    fms.voiceprint_enroll(cfg, path)  # 存声纹，下次自动认
+                except Exception:
+                    pass
             try:
                 fms.git_push_notes(cfg)
             except Exception:

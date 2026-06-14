@@ -98,6 +98,9 @@ def load_config():
     cfg.setdefault("transcript_with_speaker", True)
     cfg.setdefault("transcript_with_timestamp", False)
     cfg.setdefault("language", "zh_cn")
+    cfg.setdefault("voiceprint_enabled", True)
+    cfg.setdefault("voiceprint_threshold", 0.62)
+    cfg.setdefault("voiceprint_margin", 0.06)
     return cfg
 
 
@@ -183,6 +186,16 @@ class FeishuMinutes:
         if text.lstrip().startswith("{") and '"code"' in text[:200]:
             return None
         return text.strip()
+
+    def export_srt(self, token):
+        """导出带时间戳+说话人的 SRT（声纹分段用）。失败返回 None。"""
+        params = {"object_token": token, "add_speaker": "true",
+                  "add_timestamp": "true", "format": 3}
+        url = f"{API_BASE}/export?{urllib.parse.urlencode(params)}"
+        text = self._request("POST", url, raw=True).decode("utf-8", "replace")
+        if text.lstrip().startswith("{") and '"code"' in text[:200]:
+            return None
+        return text
 
     def fetch_summary(self, token):
         """尽力获取智能纪要，拿不到返回 None"""
@@ -570,6 +583,160 @@ def transcript_keywords(body):
     return ""
 
 
+# ---------------- 声纹识别（可选增强） ----------------
+# 标注过的人存进声纹库；新转写若声纹高置信匹配，就预填名字供你确认。
+# 重活（提取嵌入）在独立 venv 里用 sherpa-onnx 跑；主程序只做向量运算（numpy）。
+
+VOICEPRINT_DB = os.path.join(BASE_DIR, "voiceprints.json")
+VENV_PY = os.path.join(BASE_DIR, "voiceprint-venv", "bin", "python")
+WORKER = os.path.join(BASE_DIR, "voiceprint_worker.py")
+VP_MODEL = os.path.join(BASE_DIR, "voiceprint-models",
+                        "3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx")
+
+
+def voiceprint_available(cfg):
+    return (cfg.get("voiceprint_enabled", True)
+            and os.path.exists(VENV_PY) and os.path.exists(VP_MODEL)
+            and os.path.exists(WORKER))
+
+
+def _load_vpdb():
+    if os.path.exists(VOICEPRINT_DB):
+        try:
+            with open(VOICEPRINT_DB, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_vpdb(db):
+    with open(VOICEPRINT_DB, "w", encoding="utf-8") as f:
+        json.dump(db, f, ensure_ascii=False)
+
+
+def _extract_embeddings(cfg, md_path):
+    """对该转写的音频跑 worker，返回 {说话人标签: np.array 嵌入}。失败返回 {}。"""
+    import label_server
+    if not voiceprint_available(cfg):
+        return {}
+    folder = os.path.dirname(md_path)
+    audio = label_server._find_audio(folder)
+    if not audio:
+        return {}
+    with open(md_path, encoding="utf-8") as f:
+        front, _r, _b = split_frontmatter(f.read())
+    token = (front.get("source", "").rsplit("/", 1)[-1]) if front else ""
+    if not token:
+        return {}
+    try:
+        api = FeishuMinutes(cfg)
+        srt = api.export_srt(token)
+        if not srt:
+            return {}
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".srt", delete=False,
+                                         encoding="utf-8") as tf:
+            tf.write(srt)
+            srt_path = tf.name
+        r = subprocess.run([VENV_PY, WORKER, VP_MODEL, audio, srt_path],
+                           capture_output=True, text=True, timeout=180)
+        os.unlink(srt_path)
+        data = json.loads(r.stdout or "{}")
+        if "error" in data:
+            log(f"  声纹提取出错：{data['error']}")
+            return {}
+        import numpy as np
+        return {k: np.asarray(v, dtype=np.float32) for k, v in data.items()}
+    except Exception as e:
+        log(f"  声纹提取失败：{e!r}")
+        return {}
+
+
+def voiceprint_enroll(cfg, md_path):
+    """已标注的转写：把每个说话人的声纹按 名字 存进库（与历史平均）。"""
+    if not voiceprint_available(cfg):
+        return
+    import numpy as np
+    with open(md_path, encoding="utf-8") as f:
+        front, _r, _b = split_frontmatter(f.read())
+    if not front or front.get("status") != "labeled":
+        return
+    spk = front.get("speakers") or {}
+    if not spk:
+        return
+    embs = _extract_embeddings(cfg, md_path)
+    if not embs:
+        return
+    db = _load_vpdb()
+    changed = False
+    for label, value in spk.items():
+        label = re.sub(r"\s+", " ", str(label)).strip()
+        if label not in embs:
+            continue
+        name, email = parse_participant(str(value))
+        key = (email.lower() if email else name)
+        if not key:
+            continue
+        new = embs[label]
+        if key in db:
+            old = np.asarray(db[key]["emb"], dtype=np.float32)
+            cnt = db[key].get("count", 1)
+            avg = (old * cnt + new) / (cnt + 1)
+            avg = avg / (np.linalg.norm(avg) or 1)
+            db[key] = {"name": name, "email": email,
+                       "emb": avg.tolist(), "count": cnt + 1}
+        else:
+            db[key] = {"name": name, "email": email,
+                       "emb": new.tolist(), "count": 1}
+        changed = True
+    if changed:
+        _save_vpdb(db)
+        log(f"  声纹库已更新（{os.path.basename(os.path.dirname(md_path))}）")
+
+
+def voiceprint_recognize(cfg, md_path):
+    """待标注的转写：用声纹库匹配，把高置信结果写进 frontmatter 的 voiceprint 字段。"""
+    if not voiceprint_available(cfg):
+        return False
+    import numpy as np
+    db = _load_vpdb()
+    if not db:
+        return False
+    with open(md_path, encoding="utf-8") as f:
+        text = f.read()
+    front, _r, body = split_frontmatter(text)
+    if not front or front.get("status") != "needs-speakers":
+        return False
+    embs = _extract_embeddings(cfg, md_path)
+    if not embs:
+        return False
+
+    thr = float(cfg.get("voiceprint_threshold", 0.62))
+    margin = float(cfg.get("voiceprint_margin", 0.06))
+    keys = list(db.keys())
+    mat = np.asarray([db[k]["emb"] for k in keys], dtype=np.float32)
+    suggestions = {}
+    for label, v in embs.items():
+        sims = mat @ (v / (np.linalg.norm(v) or 1))
+        order = np.argsort(sims)[::-1]
+        best = float(sims[order[0]])
+        second = float(sims[order[1]]) if len(order) > 1 else -1.0
+        if best >= thr and (best - second) >= margin:
+            c = db[keys[order[0]]]
+            suggestions[label] = {"name": c["name"], "email": c.get("email", ""),
+                                  "score": round(best, 3)}
+    if not suggestions:
+        return False
+    front["voiceprint"] = suggestions
+    new_fm = yaml.safe_dump(front, allow_unicode=True, sort_keys=False).strip()
+    with open(md_path, "w", encoding="utf-8") as f:
+        f.write("---\n" + new_fm + "\n---\n" + body)
+    names = "、".join(f"{s['name']}({s['score']})" for s in suggestions.values())
+    log(f"  声纹识别：{os.path.basename(os.path.dirname(md_path))} → {names}")
+    return True
+
+
 def scan_and_apply_labels(cfg):
     """扫描归档目录，应用所有已填好的标注。返回应用的条数。"""
     save_dir = os.path.expanduser(cfg["save_dir"])
@@ -584,6 +751,10 @@ def scan_and_apply_labels(cfg):
                     applied += 1
                     log(f"  已应用说话人标注 → {os.path.basename(root)}")
                     notify("说话人标注已应用", os.path.basename(root))
+                    try:
+                        voiceprint_enroll(cfg, path)  # 标注完顺手存声纹
+                    except Exception as e:
+                        log(f"  声纹注册出错：{e!r}")
             except Exception as e:
                 log(f"  标注应用出错 {fn}: {e!r}")
     return applied
@@ -852,6 +1023,12 @@ def run_once(api, cfg, state):
         backfill_audio(api, cfg, state)
     except Exception as e:
         log(f"补音频环节出错：{e!r}")
+    # 新转写先跑声纹识别，把高置信结果预填好，再弹网页
+    for p in new_pending:
+        try:
+            voiceprint_recognize(cfg, p)
+        except Exception as e:
+            log(f"  声纹识别出错：{e!r}")
     # 有新转写待标注 → 自动弹出本地网页让你标注
     if new_pending and cfg.get("web_autopopup", True):
         open_label_page(cfg, new_pending)

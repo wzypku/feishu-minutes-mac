@@ -8,3 +8,6 @@ __pycache__/
 飞书妙记.app/
 *.app/
 .DS_Store
+voiceprint-venv/
+voiceprint-models/
+voiceprints.json
