@@ -213,29 +213,52 @@ def make_handler(cfg):
                 self._send(200, _page(title, body_html))
                 return
 
+            import json as _json
+            import re as _re
+
+            # 每个说话人的语音时间段（用于"只听 TA"），来自缓存的 SRT
+            allsegs = {}
+            try:
+                srt = fms.get_cached_srt(cfg, path)
+                if srt:
+                    allsegs = fms.srt_speaker_segments(srt)
+            except Exception:
+                pass
+
+            def pick_segs(label, cap=30.0):
+                picked, tot = [], 0.0
+                for s, e in allsegs.get(label, []):
+                    if e <= s:
+                        continue
+                    picked.append([round(s, 2), round(e, 2)])
+                    tot += e - s
+                    if tot >= cap:
+                        break
+                return picked
+
             audio = _find_audio(os.path.dirname(path))
             audio_html = ""
             if audio:
                 arel = os.path.relpath(audio, save_dir)
                 audio_html = (f"<div class='card'><div class='spk'>🎧 边听边认</div>"
-                              f"<audio controls preload='none' "
+                              f"<audio id='player' controls preload='none' "
                               f"src='/audio?f={urllib.parse.quote(arel)}'></audio>"
-                              f"<div class='sub'>听不准也没关系，下面有每人的发言示例</div></div>")
+                              f"<div class='sub'>每位说话人下方有「▶ 只听 TA」，"
+                              f"点了只播这个人的话、自动跳过别人</div></div>")
 
             # 通讯录：下拉选择，选名字自动带出邮箱
             contacts = fms.load_contacts()
             options = "".join(f"<option value='{html.escape(c.get('name',''))}'>"
                               for c in contacts)
-            import json as _json
             cmap = _json.dumps({c.get("name", ""): c.get("email", "") for c in contacts},
                                ensure_ascii=False)
 
             vp = front.get("voiceprint") or {}  # 声纹识别预填
+            seg_js = []  # 按卡片序号存每人片段
             cards = ""
             for i, label in enumerate(labels):
                 cur = "" if spk.get(label) is None else str(spk.get(label))
                 cur_name = fms.speaker_name(cur) if cur else ""
-                import re as _re
                 me = _re.search(r"<(.+?)>", cur)
                 cur_email = me.group(1).strip() if me else ""
                 vp_hint = ""
@@ -243,13 +266,29 @@ def make_handler(cfg):
                 if sug and not cur_name:  # 没手填时用声纹建议预填
                     cur_name = sug.get("name", "")
                     cur_email = sug.get("email", "") or cur_email
+                if sug:
+                    badge = "<span class='tag done'>🔊 声纹已认</span>"
                     vp_hint = (f"<div class='q' style='border-color:#3370ff;color:#3370ff'>"
                                f"🔊 声纹识别：很可能是 <b>{html.escape(sug.get('name',''))}</b>"
                                f"（置信度 {sug.get('score','')}）— 已自动填入，确认或改正即可</div>")
+                elif not cur_name:
+                    badge = "<span class='tag need'>❓ 待你确认</span>"
+                else:
+                    badge = ""
+
+                segs = pick_segs(label)
+                seg_js.append(segs)
+                play_btn = ""
+                if segs and audio:
+                    n = len(allsegs.get(label, []))
+                    play_btn = (f"<button type='button' class='ghost' "
+                                f"style='padding:6px 12px;font-size:13px;margin:6px 0' "
+                                f"onclick='playSpk({i})'>▶ 只听 {html.escape(label)}（{n} 段）</button>")
                 quotes = fms.sample_quotes_for(body, label, n=3)
                 qhtml = "".join(f"<div class='q'>“{html.escape(q)}”</div>" for q in quotes)
                 cards += (
-                    f"<div class='card'><div class='spk'>{html.escape(label)}</div>{vp_hint}{qhtml}"
+                    f"<div class='card'><div class='spk'>{html.escape(label)} {badge}</div>"
+                    f"{vp_hint}{play_btn}{qhtml}"
                     f"<input type='hidden' name='label{i}' value='{html.escape(label)}'>"
                     f"<div class='row'>"
                     f"<div class='col'><label class='fld'>名字（可下拉选历史联系人）</label>"
@@ -262,9 +301,15 @@ def make_handler(cfg):
                     f"</div></div>")
 
             js = (f"<datalist id='contacts'>{options}</datalist>"
-                  f"<script>const CMAP={cmap};"
+                  f"<script>const CMAP={cmap};const SEGS={_json.dumps(seg_js)};"
                   f"function fillEmail(inp){{const e=document.getElementById('email'+inp.dataset.i);"
-                  f"if(CMAP[inp.value]&&!e.value){{e.value=CMAP[inp.value];}}}}</script>")
+                  f"if(CMAP[inp.value]&&!e.value){{e.value=CMAP[inp.value];}}}}"
+                  f"let _q=null,_qi=0;const _A=()=>document.getElementById('player');"
+                  f"function _step(){{const a=_A();if(!a||!_q||_qi>=_q.length){{if(a)a.pause();return;}}"
+                  f"a.currentTime=_q[_qi][0];a.play();"
+                  f"a.ontimeupdate=function(){{if(a.currentTime>=_q[_qi][1]){{_qi++;"
+                  f"if(_q&&_qi<_q.length){{a.currentTime=_q[_qi][0];}}else{{a.pause();a.ontimeupdate=null;}}}}}};}}"
+                  f"function playSpk(i){{_q=SEGS[i]||[];_qi=0;if(_q.length)_step();}}</script>")
 
             body_html = (
                 f"{head}"

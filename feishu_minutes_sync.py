@@ -568,6 +568,59 @@ def compose_email(cfg, md_path, auto_send=False):
         return {"ok": False, "error": repr(e)}
 
 
+def srt_speaker_segments(srt_text):
+    """解析 SRT -> {说话人标签: [(start_s, end_s), ...]}（网页"只听TA"用）。"""
+    segs = {}
+
+    def t2s(t):
+        h, m, rest = t.split(":")
+        s, ms = rest.split(",")
+        return int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000
+
+    for block in (srt_text or "").split("\n\n"):
+        lines = [l for l in block.strip().splitlines() if l.strip()]
+        if len(lines) < 3:
+            continue
+        mt = re.match(r"(\d\d:\d\d:\d\d,\d+)\s*-->\s*(\d\d:\d\d:\d\d,\d+)", lines[1])
+        sp = re.match(r"(说话人\s*\d+)\s*[:：]", lines[2])
+        if not mt or not sp:
+            continue
+        label = re.sub(r"\s+", " ", sp.group(1)).strip()
+        try:
+            segs.setdefault(label, []).append((t2s(mt.group(1)), t2s(mt.group(2))))
+        except ValueError:
+            continue
+    return segs
+
+
+def get_cached_srt(cfg, md_path):
+    """拿该转写的 SRT：优先读音频旁的缓存 .transcript.srt，没有就拉一次并缓存。"""
+    folder = os.path.dirname(md_path)
+    cache = os.path.join(folder, ".transcript.srt")
+    if os.path.exists(cache):
+        try:
+            with open(cache, encoding="utf-8") as f:
+                return f.read()
+        except OSError:
+            pass
+    with open(md_path, encoding="utf-8") as f:
+        front, _r, _b = split_frontmatter(f.read())
+    token = (front.get("source", "").rsplit("/", 1)[-1]) if front else ""
+    if not token:
+        return ""
+    try:
+        srt = FeishuMinutes(cfg).export_srt(token) or ""
+    except Exception:
+        return ""
+    if srt:
+        try:
+            with open(cache, "w", encoding="utf-8") as f:
+                f.write(srt)
+        except OSError:
+            pass
+    return srt
+
+
 def transcript_keywords(body):
     """提取转写里的『关键词:』那一行，用作列表里的内容概要。"""
     lines = (body or "").splitlines()
