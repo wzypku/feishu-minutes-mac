@@ -11,7 +11,9 @@
 """
 
 import json
+import os
 import re
+import shutil
 import subprocess
 import sys
 
@@ -20,6 +22,20 @@ import sherpa_onnx
 
 SR = 16000
 MIN_SECONDS = 3.0  # 某说话人有效语音不足这么长就不提取（不可靠）
+
+
+def find_ffmpeg():
+    """launchd 后台环境 PATH 很窄，找不到 homebrew 的 ffmpeg，这里兜底绝对路径。"""
+    p = shutil.which("ffmpeg")
+    if p:
+        return p
+    for c in ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"):
+        if os.path.exists(c):
+            return c
+    return "ffmpeg"
+
+
+FFMPEG = find_ffmpeg()
 
 
 def srt_segments(srt_text):
@@ -46,7 +62,7 @@ def srt_segments(srt_text):
 
 def decode_audio(path):
     raw = subprocess.run(
-        ["ffmpeg", "-v", "quiet", "-i", path, "-ac", "1", "-ar", str(SR),
+        [FFMPEG, "-v", "quiet", "-i", path, "-ac", "1", "-ar", str(SR),
          "-f", "f32le", "-"],
         capture_output=True).stdout
     return np.frombuffer(raw, dtype=np.float32)
