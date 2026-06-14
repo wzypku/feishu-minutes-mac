@@ -668,23 +668,38 @@ def _save_vpdb(db):
         json.dump(db, f, ensure_ascii=False)
 
 
-def _extract_embeddings(cfg, md_path):
-    """对该转写的音频跑 worker，返回 {说话人标签: np.array 嵌入}。失败返回 {}。"""
+def _extract_embeddings(cfg, md_path, allow_compute=True):
+    """对该转写的音频提取 {说话人标签: np.array 嵌入}。
+    结果缓存在音频旁 .embeddings.json，重复调用毫秒返回。
+    allow_compute=False 时只读缓存（不跑昂贵的提取），缓存没有就返回 {}。"""
+    import numpy as np
     import label_server
     if not voiceprint_available(cfg):
         return {}
     folder = os.path.dirname(md_path)
+    with open(md_path, encoding="utf-8") as f:
+        front, _r, body = split_frontmatter(f.read())
+    labels = set(detect_generic_speakers(body))
+    cache = os.path.join(folder, ".embeddings.json")
+    # 命中缓存：缓存覆盖了当前所有说话人就直接用
+    if labels and os.path.exists(cache):
+        try:
+            with open(cache, encoding="utf-8") as f:
+                data = json.load(f)
+            if labels <= set(data.keys()):
+                return {k: np.asarray(data[k], dtype=np.float32) for k in labels}
+        except Exception:
+            pass
+    if not allow_compute:
+        return {}
     audio = label_server._find_audio(folder)
     if not audio:
         return {}
-    with open(md_path, encoding="utf-8") as f:
-        front, _r, _b = split_frontmatter(f.read())
     token = (front.get("source", "").rsplit("/", 1)[-1]) if front else ""
     if not token:
         return {}
     try:
-        api = FeishuMinutes(cfg)
-        srt = api.export_srt(token)
+        srt = FeishuMinutes(cfg).export_srt(token)
         if not srt:
             return {}
         import tempfile
@@ -699,7 +714,11 @@ def _extract_embeddings(cfg, md_path):
         if "error" in data:
             log(f"  声纹提取出错：{data['error']}")
             return {}
-        import numpy as np
+        try:
+            with open(cache, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except OSError:
+            pass
         return {k: np.asarray(v, dtype=np.float32) for k, v in data.items()}
     except Exception as e:
         log(f"  声纹提取失败：{e!r}")
@@ -748,8 +767,9 @@ def voiceprint_enroll(cfg, md_path):
         log(f"  声纹库已更新（{os.path.basename(os.path.dirname(md_path))}）")
 
 
-def voiceprint_recognize(cfg, md_path):
-    """待标注的转写：用声纹库匹配，把高置信结果写进 frontmatter 的 voiceprint 字段。"""
+def voiceprint_recognize(cfg, md_path, allow_compute=True):
+    """待标注的转写：用声纹库匹配，把高置信结果写进 frontmatter 的 voiceprint 字段。
+    allow_compute=False 时只用已缓存的声纹特征（不跑昂贵提取）。"""
     if not voiceprint_available(cfg):
         return False
     import numpy as np
@@ -761,7 +781,7 @@ def voiceprint_recognize(cfg, md_path):
     front, _r, body = split_frontmatter(text)
     if not front or front.get("status") != "needs-speakers":
         return False
-    embs = _extract_embeddings(cfg, md_path)
+    embs = _extract_embeddings(cfg, md_path, allow_compute=allow_compute)
     if not embs:
         return False
 
@@ -788,6 +808,48 @@ def voiceprint_recognize(cfg, md_path):
     names = "、".join(f"{s['name']}({s['score']})" for s in suggestions.values())
     log(f"  声纹识别：{os.path.basename(os.path.dirname(md_path))} → {names}")
     return True
+
+
+def periodic_recognize(cfg, state, compute_budget=6):
+    """每轮对"还没标注、还没认出"的转写重跑声纹匹配。
+    - 已缓存声纹特征的：毫秒级重比对（覆盖"库里新增了人"的情况）。
+    - 没缓存的：本轮最多算 compute_budget 条（控制单轮耗时），其余下轮继续。
+    返回新得到建议的条数。"""
+    if not voiceprint_available(cfg):
+        return 0
+    import glob
+    db = _load_vpdb()
+    if not db:
+        return 0
+    lib_size = len(db)
+    lib_grew = lib_size != state.get("vp_lib_size")
+    save_dir = os.path.expanduser(cfg["save_dir"])
+    budget = compute_budget
+    hits = 0
+    for md in glob.glob(os.path.join(save_dir, "*", "*.md")):
+        try:
+            with open(md, encoding="utf-8") as f:
+                front, _r, body = split_frontmatter(f.read())
+            if not front or front.get("status") != "needs-speakers":
+                continue
+            if not detect_generic_speakers(body):
+                continue
+            # 库没变且这条已有建议 → 跳过（省事）
+            if front.get("voiceprint") and not lib_grew:
+                continue
+            folder = os.path.dirname(md)
+            cached = os.path.exists(os.path.join(folder, ".embeddings.json"))
+            if not cached:
+                if budget <= 0:
+                    continue  # 本轮提取预算用完，下轮再算
+                budget -= 1
+            if voiceprint_recognize(cfg, md, allow_compute=True):
+                hits += 1
+        except Exception as e:
+            log(f"  周期声纹识别出错 {os.path.basename(md)}: {e!r}")
+    state["vp_lib_size"] = lib_size
+    save_state(state)
+    return hits
 
 
 def sync_titles(cfg, api=None):
@@ -1167,7 +1229,7 @@ def run_once(api, cfg, state):
         backfill_audio(api, cfg, state)
     except Exception as e:
         log(f"补音频环节出错：{e!r}")
-    # 新转写先跑声纹识别，把高置信结果预填好，再弹网页
+    # 新转写立即跑一次声纹识别，把高置信结果预填好，再弹网页
     for p in new_pending:
         try:
             voiceprint_recognize(cfg, p)
@@ -1181,6 +1243,11 @@ def run_once(api, cfg, state):
         refresh_transcripts(cfg, api, state)
     except Exception as e:
         log(f"转写补刷环节出错：{e!r}")
+    # 周期性声纹重认：补刷出来的、以及库里新增人后的老转写，都会被覆盖到
+    try:
+        periodic_recognize(cfg, state)
+    except Exception as e:
+        log(f"周期声纹识别出错：{e!r}")
     # 飞书事后改名 → 同步到本地标题
     try:
         sync_titles(cfg, api)
