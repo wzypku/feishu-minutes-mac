@@ -266,7 +266,15 @@ def make_handler(cfg):
                 if sug and not cur_name:  # 没手填时用声纹建议预填
                     cur_name = sug.get("name", "")
                     cur_email = sug.get("email", "") or cur_email
-                if sug:
+                if sug and sug.get("uncertain"):
+                    badge = "<span class='tag need'>🔊 声纹·待确认</span>"
+                    alt = sug.get("alt", "")
+                    vp_hint = (f"<div class='q' style='border-color:#d46b08;color:#d46b08'>"
+                               f"🔊 声纹：可能是 <b>{html.escape(sug.get('name',''))}</b>"
+                               f"（{sug.get('score','')}）"
+                               + (f"，也接近 {html.escape(alt)}" if alt else "")
+                               + "，已暂填，<b>请确认</b></div>")
+                elif sug:
                     badge = "<span class='tag done'>🔊 声纹已认</span>"
                     vp_hint = (f"<div class='q' style='border-color:#3370ff;color:#3370ff'>"
                                f"🔊 声纹识别：很可能是 <b>{html.escape(sug.get('name',''))}</b>"

@@ -820,17 +820,24 @@ def voiceprint_recognize(cfg, md_path, allow_compute=True):
         order = np.argsort(sims)[::-1]
         best = float(sims[order[0]])
         second = float(sims[order[1]]) if len(order) > 1 else -1.0
-        if best >= thr and (best - second) >= margin:
-            c = db[keys[order[0]]]
-            suggestions[label] = {"name": c["name"], "email": c.get("email", ""),
-                                  "score": round(best, 3)}
+        if best < thr:
+            continue  # 绝对相似度都不够 → 真不在库里，不猜
+        c = db[keys[order[0]]]
+        sug = {"name": c["name"], "email": c.get("email", ""), "score": round(best, 3)}
+        # 第二名很接近 → 标为"不太确定"，并给出备选，让你确认而不是直接憋掉
+        if (best - second) < margin and len(order) > 1:
+            sug["uncertain"] = True
+            sug["alt"] = db[keys[order[1]]]["name"]
+        suggestions[label] = sug
     if not suggestions:
         return False
     front["voiceprint"] = suggestions
     new_fm = yaml.safe_dump(front, allow_unicode=True, sort_keys=False).strip()
     with open(md_path, "w", encoding="utf-8") as f:
         f.write("---\n" + new_fm + "\n---\n" + body)
-    names = "、".join(f"{s['name']}({s['score']})" for s in suggestions.values())
+    names = "、".join(f"{s['name']}({s['score']})"
+                      + ("?" if s.get("uncertain") else "")
+                      for s in suggestions.values())
     log(f"  声纹识别：{os.path.basename(os.path.dirname(md_path))} → {names}")
     return True
 
