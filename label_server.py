@@ -62,6 +62,7 @@ a { color: #3370ff; text-decoration: none; }
 .tag { font-size:12px; padding:2px 8px; border-radius:10px; }
 .tag.need { background:#fff3e0; color:#d46b08; }
 .tag.done { background:#e7f9ec; color:#13a452; }
+.tag.sent { background:#e8f0fe; color:#3370ff; margin-right:6px; }
 .hint { background:#eef4ff; color:#3370ff; padding:10px 12px; border-radius:8px;
   font-size:13px; margin-bottom:14px; }
 """
@@ -135,7 +136,8 @@ def make_handler(cfg):
                             "duration": str(front.get("duration", "")),
                             "kw": fms.transcript_keywords(body),
                             "parts": front.get("participants") or [],
-                            "hidden": is_hidden}
+                            "hidden": is_hidden,
+                            "sent_at": str(front.get("sent_at", ""))}
                     # 待标注 = 有未填的说话人；其余（含单人录音）都归"已处理"，全部显示
                     st = front.get("status")
                     is_pending = False
@@ -166,10 +168,14 @@ def make_handler(cfg):
                 else:
                     btn = (f"<button type='button' class='hidebtn' data-rel=\"{drel}\" "
                            f"data-act='hide'>🙈 隐藏</button>")
+                sent = ""
+                if info.get("sent_at"):
+                    sent = (f"<span class='tag sent' title='发送于 {html.escape(info['sent_at'])}'>"
+                            f"✉️ 已发送</span>")
                 return (f"<div class='entry'>"
                         f"<a class='entrylink' href='/edit?f={q}'>"
                         f"<div class='etop'><span class='etitle'>{html.escape(info['title'])}</span>"
-                        f"<span class='tag {tag_cls}'>{tag_txt}</span></div>"
+                        f"<span style='flex:none'>{sent}<span class='tag {tag_cls}'>{tag_txt}</span></span></div>"
                         f"<div class='sub' style='margin:2px 0 0'>🕒 {html.escape(meta)}</div>"
                         f"{kw}{ppl}</a>{btn}</div>")
 
@@ -230,13 +236,15 @@ def make_handler(cfg):
                 has_email = bool(to_names)
                 auto = bool(cfg.get("email_auto_send", False))
                 send_btn = ""
+                sent_at = front.get("sent_at", "")
                 if has_email:
                     if auto:
-                        btxt = f"✉️ 直接发送给 {len(to_names)} 位参与者"
-                        confirm = ("onsubmit=\"return confirm('确定直接发送给："
+                        btxt = (f"✉️ 重新发送给 {len(to_names)} 位参与者" if sent_at
+                                else f"✉️ 直接发送给 {len(to_names)} 位参与者")
+                        confirm = ("onsubmit=\"return confirm('确定发送给："
                                    + "、".join(to_names) + "？发送后无法撤回。')\"")
                     else:
-                        btxt = "✉️ 用 Outlook 打开草稿"
+                        btxt = "✉️ 重新打开草稿" if sent_at else "✉️ 用 Outlook 打开草稿"
                         confirm = ""
                     send_btn = (f"<form method='POST' action='/send' style='display:inline' "
                                 f"{confirm}>"
@@ -244,8 +252,15 @@ def make_handler(cfg):
                                 f"<button type='submit'>{btxt}</button></form>")
                 else:
                     send_btn = "<div class='sub'>（参与者都没填邮箱，无法发送）</div>"
+                sent_banner = ""
+                if sent_at:
+                    sent_to = front.get("sent_to") or []
+                    sent_banner = (
+                        f"<div class='hint' style='background:#e8f0fe;color:#3370ff'>"
+                        f"✉️ 已于 <b>{html.escape(str(sent_at))}</b> 发送给："
+                        + "、".join(html.escape(str(s)) for s in sent_to) + "</div>")
                 body_html = (
-                    f"{head}"
+                    f"{head}{sent_banner}"
                     f"<div class='hint'>这条已标注。participants（可直接用于发送）：</div>"
                     f"<div class='card'>{items or '（无）'}</div>"
                     f"<div class='bar'>{send_btn} "
@@ -428,6 +443,12 @@ def make_handler(cfg):
                              f"← 返回</a></div>")
                 self._send(200, _page("发送", body_html))
                 return
+            # 真正发出去（auto_send）才标记已发送；只生成草稿不算
+            if res["mode"] == "sent":
+                try:
+                    fms.mark_sent(path, res["to"])
+                except Exception:
+                    pass
             to_html = "".join(f"<div class='q'>{html.escape(n)} &lt;{html.escape(e)}&gt;</div>"
                               for n, e in res["to"])
             noemail = ""

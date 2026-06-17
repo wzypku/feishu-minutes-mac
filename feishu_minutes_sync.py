@@ -568,6 +568,19 @@ def compose_email(cfg, md_path, auto_send=False):
         return {"ok": False, "error": repr(e)}
 
 
+def mark_sent(md_path, recipients):
+    """发送成功后在 frontmatter 记录发送时间和收件人，列表/编辑页据此显示"已发送"。"""
+    with open(md_path, encoding="utf-8") as f:
+        front, _raw, body = split_frontmatter(f.read())
+    if front is None:
+        return
+    front["sent_at"] = time.strftime("%Y-%m-%d %H:%M")
+    front["sent_to"] = [f"{n} <{e}>" if e else n for n, e in recipients]
+    new_fm = yaml.safe_dump(front, allow_unicode=True, sort_keys=False).strip()
+    with open(md_path, "w", encoding="utf-8") as f:
+        f.write("---\n" + new_fm + "\n---\n" + body)
+
+
 def srt_speaker_segments(srt_text):
     """解析 SRT -> {说话人标签: [(start_s, end_s), ...]}（网页"只听TA"用）。"""
     segs = {}
