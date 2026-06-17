@@ -864,6 +864,8 @@ def periodic_recognize(cfg, state, compute_budget=6):
                 front, _r, body = split_frontmatter(f.read())
             if not front or front.get("status") != "needs-speakers":
                 continue
+            if front.get("hidden"):
+                continue  # 你隐藏的私人内容，不再跑声纹
             if not detect_generic_speakers(body):
                 continue
             # 库没变且这条已有建议 → 跳过（省事）

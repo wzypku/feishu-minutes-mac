@@ -49,9 +49,14 @@ a { color: #3370ff; text-decoration: none; }
   display:flex; gap:12px; }
 .item { display:flex; justify-content:space-between; align-items:center;
   padding:12px 0; border-bottom:1px solid #eee; }
-.entry { display:block; padding:12px 4px; border-bottom:1px solid #eee;
-  color:#1f2329; }
+.entry { display:flex; align-items:center; gap:10px; padding:12px 4px;
+  border-bottom:1px solid #eee; color:#1f2329; }
 .entry:last-child { border-bottom:0; }
+.entrylink { display:block; flex:1; min-width:0; color:#1f2329; }
+.hidebtn { background:#fff; color:#8f959e; border:1px solid #d7d9de;
+  border-radius:8px; padding:6px 10px; font-size:12px; cursor:pointer;
+  white-space:nowrap; flex:none; }
+.hidebtn:hover { color:#d4380d; border-color:#d4380d; }
 .etop { display:flex; justify-content:space-between; align-items:center; }
 .etitle { font-weight:600; color:#1f2329; }
 .tag { font-size:12px; padding:2px 8px; border-radius:10px; }
@@ -104,8 +109,9 @@ def make_handler(cfg):
             self.wfile.write(body)
 
         # ---------- 列表页 ----------
-        def page_index(self):
+        def page_index(self, show_hidden=False):
             pending, labeled = [], []
+            hidden_count = 0
             for root, _d, files in os.walk(save_dir):
                 for fn in files:
                     if not fn.endswith(".md"):
@@ -118,12 +124,18 @@ def make_handler(cfg):
                         continue
                     if not front:
                         continue
+                    is_hidden = bool(front.get("hidden"))
+                    if is_hidden:
+                        hidden_count += 1
+                        if not show_hidden:
+                            continue  # 隐藏的：默认不出现在列表里
                     rel = os.path.relpath(path, save_dir)
                     info = {"title": front.get("title", fn), "rel": rel,
                             "date": str(front.get("date", "")),
                             "duration": str(front.get("duration", "")),
                             "kw": fms.transcript_keywords(body),
-                            "parts": front.get("participants") or []}
+                            "parts": front.get("participants") or [],
+                            "hidden": is_hidden}
                     # 待标注 = 有未填的说话人；其余（含单人录音）都归"已处理"，全部显示
                     st = front.get("status")
                     is_pending = False
@@ -144,11 +156,19 @@ def make_handler(cfg):
                     names = "、".join(fms.speaker_name(str(p)) for p in info["parts"])
                     ppl = (f"<div class='q' style='border:0;padding:0;margin-top:2px'>👥 "
                            f"{html.escape(names)}</div>")
-                return (f"<a class='entry' href='/edit?f={urllib.parse.quote(info['rel'])}'>"
+                q = urllib.parse.quote(info["rel"])
+                if info.get("hidden"):
+                    btn = (f"<button type='button' class='hidebtn' "
+                           f"onclick=\"hideItem(event,'{q}','unhide')\">↩︎ 取消隐藏</button>")
+                else:
+                    btn = (f"<button type='button' class='hidebtn' "
+                           f"onclick=\"hideItem(event,'{q}','hide')\">🙈 隐藏</button>")
+                return (f"<div class='entry'>"
+                        f"<a class='entrylink' href='/edit?f={q}'>"
                         f"<div class='etop'><span class='etitle'>{html.escape(info['title'])}</span>"
                         f"<span class='tag {tag_cls}'>{tag_txt}</span></div>"
                         f"<div class='sub' style='margin:2px 0 0'>🕒 {html.escape(meta)}</div>"
-                        f"{kw}{ppl}</a>")
+                        f"{kw}{ppl}</a>{btn}</div>")
 
             rows = ""
             if not pending:
@@ -159,9 +179,22 @@ def make_handler(cfg):
             if labeled:
                 rows += "<div class='sub' style='margin-top:18px'>已标注</div>"
                 rows += "<div class='card'>" + "".join(
-                    card(i, "done", "已标注") for i in labeled[:40]) + "</div>"
+                    card(i, "done", "已标注") for i in labeled[:60]) + "</div>"
+
+            toggle = ""
+            if hidden_count:
+                if show_hidden:
+                    toggle = "<a href='/'>← 隐藏已隐藏项</a>"
+                else:
+                    toggle = f"<a href='/?hidden=1'>👁 显示已隐藏（{hidden_count}）</a>"
+            js = ("<script>function hideItem(e,f,act){e.preventDefault();e.stopPropagation();"
+                  "fetch('/hide',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},"
+                  "body:'f='+encodeURIComponent(f)+'&act='+act}).then(()=>location.reload());}</script>")
             body = (f"<h1>飞书妙记 · 说话人标注</h1>"
-                    f"<div class='sub'>待标注 {len(pending)} 个 · 已标注 {len(labeled)} 个</div>{rows}")
+                    f"<div class='sub'>待标注 {len(pending)} 个 · 已标注 {len(labeled)} 个"
+                    + (f" · 已隐藏 {hidden_count} 个" if hidden_count else "")
+                    + f"</div>{rows}"
+                    + (f"<div class='bar'>{toggle}</div>" if toggle else "") + js)
             self._send(200, _page("说话人标注", body))
 
         # ---------- 编辑页 ----------
@@ -404,6 +437,25 @@ def make_handler(cfg):
                          f"<div class='bar'><a href='/'>← 返回列表</a></div>")
             self._send(200, _page("发送", body_html))
 
+        # ---------- 隐藏/取消隐藏 ----------
+        def do_hide(self, form):
+            rel = form.get("f", [""])[0]
+            act = form.get("act", ["hide"])[0]
+            path = _safe_path(save_dir, rel)
+            with open(path, encoding="utf-8") as f:
+                front, _raw, body = fms.split_frontmatter(f.read())
+            if front is None:
+                self._send(404, b"bad", "text/plain")
+                return
+            if act == "unhide":
+                front.pop("hidden", None)
+            else:
+                front["hidden"] = True
+            new_fm = yaml.safe_dump(front, allow_unicode=True, sort_keys=False).strip()
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("---\n" + new_fm + "\n---\n" + body)
+            self._send(200, b"ok", "text/plain")
+
         # ---------- 音频 ----------
         def serve_audio(self, rel):
             path = _safe_path(save_dir, rel)
@@ -420,7 +472,7 @@ def make_handler(cfg):
             q = urllib.parse.parse_qs(u.query)
             try:
                 if u.path == "/":
-                    self.page_index()
+                    self.page_index(show_hidden=bool(q.get("hidden")))
                 elif u.path == "/edit":
                     self.page_edit(q.get("f", [""])[0])
                 elif u.path == "/audio":
@@ -440,6 +492,8 @@ def make_handler(cfg):
                     self.do_save(form)
                 elif p == "/send":
                     self.do_send(form)
+                elif p == "/hide":
+                    self.do_hide(form)
                 else:
                     self._send(404, _page("404", "<h1>404</h1>"))
             except Exception as e:
