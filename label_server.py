@@ -157,12 +157,15 @@ def make_handler(cfg):
                     ppl = (f"<div class='q' style='border:0;padding:0;margin-top:2px'>👥 "
                            f"{html.escape(names)}</div>")
                 q = urllib.parse.quote(info["rel"])
+                # data-rel 存原始路径（HTML 转义即可），JS 里用 encodeURIComponent 单次编码，
+                # 避免 onclick 内联字符串里的引号/编码问题
+                drel = html.escape(info["rel"], quote=True)
                 if info.get("hidden"):
-                    btn = (f"<button type='button' class='hidebtn' "
-                           f"onclick=\"hideItem(event,'{q}','unhide')\">↩︎ 取消隐藏</button>")
+                    btn = (f"<button type='button' class='hidebtn' data-rel=\"{drel}\" "
+                           f"data-act='unhide'>↩︎ 取消隐藏</button>")
                 else:
-                    btn = (f"<button type='button' class='hidebtn' "
-                           f"onclick=\"hideItem(event,'{q}','hide')\">🙈 隐藏</button>")
+                    btn = (f"<button type='button' class='hidebtn' data-rel=\"{drel}\" "
+                           f"data-act='hide'>🙈 隐藏</button>")
                 return (f"<div class='entry'>"
                         f"<a class='entrylink' href='/edit?f={q}'>"
                         f"<div class='etop'><span class='etitle'>{html.escape(info['title'])}</span>"
@@ -187,9 +190,13 @@ def make_handler(cfg):
                     toggle = "<a href='/'>← 隐藏已隐藏项</a>"
                 else:
                     toggle = f"<a href='/?hidden=1'>👁 显示已隐藏（{hidden_count}）</a>"
-            js = ("<script>function hideItem(e,f,act){e.preventDefault();e.stopPropagation();"
+            js = ("<script>document.addEventListener('click',function(e){"
+                  "var b=e.target.closest('.hidebtn');if(!b)return;"
+                  "e.preventDefault();e.stopPropagation();b.disabled=true;b.textContent='…';"
                   "fetch('/hide',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},"
-                  "body:'f='+encodeURIComponent(f)+'&act='+act}).then(()=>location.reload());}</script>")
+                  "body:'f='+encodeURIComponent(b.dataset.rel)+'&act='+b.dataset.act})"
+                  ".then(function(r){if(!r.ok)throw 0;location.reload();})"
+                  ".catch(function(){b.disabled=false;b.textContent='✗ 失败，重试';});});</script>")
             body = (f"<h1>飞书妙记 · 说话人标注</h1>"
                     f"<div class='sub'>待标注 {len(pending)} 个 · 已标注 {len(labeled)} 个"
                     + (f" · 已隐藏 {hidden_count} 个" if hidden_count else "")
